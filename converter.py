@@ -9,6 +9,7 @@ def haproxy_to_nginx(haproxy_config):
     acl_rules = []
     use_backend_rules = []
     stick_table_settings = []
+    stats_block = []
 
     # Parse HAProxy config
     for line in haproxy_config.splitlines():
@@ -136,6 +137,13 @@ def haproxy_to_nginx(haproxy_config):
                 upstream_options.append(f'    # Unsupported balance method: {balance_method}')
             continue
 
+        # Convert listen stats
+        if line.startswith("listen stats"):
+            stats_block.append("location /stats {")
+            stats_block.append("    stub_status;")
+            stats_block.append("}")
+            continue
+
         # Add unsupported settings as comments
         nginx_config.append(f'# Unsupported setting: {line}')
 
@@ -150,6 +158,8 @@ def haproxy_to_nginx(haproxy_config):
         nginx_config.extend(use_backend_rules)
     if stick_table_settings:
         nginx_config.extend(stick_table_settings)
+    if stats_block:
+        nginx_config.extend(stats_block)
 
     nginx_config.append('}')
     return '\n'.join(nginx_config)
@@ -158,29 +168,65 @@ def haproxy_to_nginx(haproxy_config):
 haproxy_example_config = """
 global
     log /dev/log local0
-    maxconn 4096
+    log /dev/log local1 notice
+    maxconn 10000
+    user haproxy
+    group haproxy
+    daemon
+    stats socket /run/haproxy.sock mode 660 level admin
 
 defaults
     log     global
     option  httplog
+    option  dontlognull
+    option  redispatch
+    retries 3
     timeout connect 5000ms
     timeout client 50000ms
+    timeout server 50000ms
     timeout queue 1000ms
+    timeout http-request 10s
+    timeout http-keep-alive 10s
 
 frontend http-in
-    bind *:80 ssl crt /path/to/cert.pem key=/path/to/key.pem
+    bind *:80
+    bind *:443 ssl crt /etc/haproxy/certs/server.pem alpn h2,http/1.1
+    mode http
     acl is_api path_beg /api
-    acl is_admin hdr_beg(host) admin
+    acl is_static path_end .jpg .png .css .js
     use_backend api_backend if is_api
-    use_backend admin_backend if is_admin
+    use_backend static_backend if is_static
+    default_backend default_backend
 
 backend api_backend
     balance roundrobin
-    server api1 192.168.1.1:80 check rise 3 fall 2 inter 5000ms
+    option httpchk HEAD /health HTTP/1.1\r\nHost:\ api.example.com
+    http-request set-header X-Forwarded-Proto https if { ssl_fc }
+    server api1 192.168.1.1:80 check
+    server api2 192.168.1.2:80 check
 
-backend admin_backend
-    balance hash
-    server admin1 192.168.1.2:80 check
+backend static_backend
+    balance leastconn
+    option httpchk HEAD /health HTTP/1.1\r\nHost:\ static.example.com
+    stick-table type ip size 200k expire 30m
+    stick on src
+    server static1 192.168.2.1:80 check
+    server static2 192.168.2.2:80 check
+
+backend default_backend
+    balance roundrobin
+    option httpchk GET /health HTTP/1.1\r\nHost:\ default.example.com
+    server default1 192.168.3.1:80 check
+    server default2 192.168.3.2:80 check
+
+listen stats
+    bind *:8404
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    stats auth admin:password
+    stats admin if LOCALHOST
+
 """
 
 nginx_config = haproxy_to_nginx(haproxy_example_config)
